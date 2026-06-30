@@ -19,7 +19,9 @@
 8. [Physical wiring reference](#8-physical-wiring-reference)
 9. [How to run the tests](#9-how-to-run-the-tests)
 10. [Reading test output and what failures mean](#10-reading-test-output-and-what-failures-mean)
-11. [Glossary](#11-glossary)
+11. [Jupyter notebook testing and known issues](#11-jupyter-notebook-testing-and-known-issues)
+12. [PID tuning in practice — the Ziegler-Nichols autotuner](#12-pid-tuning-in-practice--the-ziegler-nichols-autotuner)
+13. [Glossary](#13-glossary)
 
 ---
 
@@ -352,6 +354,52 @@ The tests write setpoints of 20 °C, 25 °C, and 30 °C, then immediately read b
 
 > **Important:** These tests check the *stored register value*, not the *measured temperature*. The measured temperature will lag behind the setpoint while the PID works to reach it. The register readback should be immediate and exact.
 
+### How the PID controller works
+
+The TEC does not just switch the Peltier on or off — it uses a **PID loop** to continuously calculate exactly how much current the Peltier needs at any instant. Understanding this helps interpret the test results and the live monitoring output.
+
+#### The three terms
+
+| Term | Full name | What it does | Analogy |
+|---|---|---|---|
+| **P** | Proportional | Pushes harder the further the temperature is from the setpoint | Pressing the car's accelerator harder the more you're below your target speed |
+| **I** | Integral | Corrects for a small persistent error that P alone cannot fully close | Noticing you've been 2 km/h under target for a while and adding a tiny extra push |
+| **D** | Derivative | Eases off as the temperature approaches the setpoint to prevent overshooting | Releasing the accelerator slightly as you near your target speed so you don't fly past it |
+
+Together they produce a single output: the drive current to the Peltier element.
+
+#### What you see in the live data
+
+Immediately after enabling the TEC with a new setpoint, the temperature error is at its maximum (e.g. 2 °C off). The P term dominates and the controller drives close to its maximum allowed current (you might see ~0.8 A). As the temperature climbs toward the setpoint, the error shrinks and so does the P output. The I term corrects any small remaining offset. The D term damps the approach to prevent oscillation. When temperature has stabilised:
+
+- Error ≈ 0 °C
+- Drive current drops to a small maintenance value (just enough to overcome passive heat flow through the mount)
+- At the 0.1 A register resolution this maintenance current often reads as **0.000 A** — this is normal, not a fault
+
+This is why the TEC current test in the notebook checks the **peak** current at the start of the ramp, not the current at the end.
+
+#### A typical PID response trace
+
+```
+PID Monitor — Setpoint: 27.00 degC
+ Time    Temp     Error    TEC I    What is happening
+    0s   24.0   -3.00°C   0.80 A   P term dominant — max drive current
+    4s   24.6   -2.40°C   0.65 A   Temperature rising, P output reducing
+    8s   25.4   -1.60°C   0.48 A   I term starting to accumulate
+   12s   26.1   -0.90°C   0.30 A   Closing in on setpoint
+   16s   26.7   -0.30°C   0.10 A   D term braking the approach
+   20s   27.0   -0.02°C   0.02 A   Settled — maintenance current only
+   24s   27.0    0.00°C   0.00 A   Stable — current below register resolution
+```
+
+#### Factory tuning and register write access
+
+The SF8025-NM ships with gains (P, I, D values) already set by Maiman. The `TestPIDParameters` tests read them and confirm they are non-zero (an all-zero PID means the controller shipped unconfigured and temperature regulation will not work).
+
+Although the datasheet does not document the PID registers as writable, **they are in fact writable** — this was confirmed by testing with the BenchSoft GUI software and via direct serial commands. The Python driver exposes this via `set_pid_p()`, `set_pid_i()`, `set_pid_d()`, and `set_pid()`. See Section 12 for the full tuning workflow and important firmware constraints before changing these values.
+
+---
+
 ### Phase 4 — PID parameters (`TestPIDParameters`)
 
 Reads the three PID gain registers (P, I, D) and checks:
@@ -508,6 +556,50 @@ controller.set_tec_on()              # 4. send Start command
 
 ---
 
+### Bug 3 — `get_tec_current()` returns impossible values: signed register read as unsigned
+
+**Symptom:** `get_tec_current()` returned values such as `6553.5 A` or `6553.4 A` during a real TEC run. The physical current limit of the controller is 1.0 A, so these values are impossible.
+
+**Root cause:** The `TEC_CURRENT_MEASURED` register (`0A16h`) stores the Peltier drive current as a **signed 16-bit two's complement integer**. A positive value means the Peltier is running in the heating direction; a negative value means it is running in the cooling direction. The `rtoi()` helper always decodes the 4-digit hex response as an **unsigned** integer (0 – 65535), so it cannot represent negative numbers. When the Peltier was running at –0.1 A, the register returned `FFFF` (hex), which `rtoi()` decoded as 65535, and after dividing by 10 gave `6553.5 A`.
+
+The comment `***NO NEGATIVE NUMBERS***` at the top of the original controller file was an author note warning that the protocol helpers did not handle negatives — not a statement that the hardware never produces them.
+
+**Fix:** Added a two's complement conversion in `get_tec_current()`:
+```python
+def get_tec_current(self):
+    res = self.__get_response('TEC_CURRENT_MEASURED')
+    raw = res.rtoi()        # unsigned 0–65535
+    if raw >= 0x8000:       # high bit set → negative in two's complement
+        raw -= 0x10000
+    return raw / 10
+```
+After this fix, `FFFF` → –1 → –0.1 A (small cooling current), and `0008` → 8 → +0.8 A (heating). The sign now tells you which direction the Peltier is running.
+
+**File changed:** `controller.py` (`get_tec_current()` — two's complement correction added).
+
+---
+
+### Bug 6 — Firmware PID corruption: TEC will not restart after writing very small I or D values
+
+**Symptom:** After writing PID values with I ≤ ~50 or D ≤ ~50 to the controller, the TEC stops being startable. Every subsequent call to `set_tec_on()` returns `"Failed to set TEC on. Interlock?"` regardless of the PID values loaded afterward. All lock and interlock flags read as "ok". A hardware power cycle is the only recovery.
+
+**Root cause:** The Maiman firmware's TEC PID engine appears to have a minimum acceptable value for I and D. When values below this threshold are loaded (e.g. I=10, D=10), the firmware accepts the write silently but the internal PID computation enters a broken state — likely a division-by-zero or integer underflow in the control loop calculation. Once broken, the firmware refuses to start the TEC regardless of what PID values are subsequently written. This is a stricter version of the known D=0 crash: D=0 is the most severe case, but very small I or D (below approximately 50–100) causes the same outcome more slowly.
+
+This was discovered during development of the Ziegler-Nichols autotuner (Section 12), which initially used I_SAFE=10, D_SAFE=10 to minimise the integrator's influence during the proportional-gain search. These values rendered the TEC inoperable on the first trial.
+
+**Fix:** Never write I < 100 or D < 50 to the controller. The autotuner default parameters were updated to I_SAFE=500, D_SAFE=50, which have been confirmed to work reliably without triggering this state.
+
+The full list of known PID firmware constraints:
+- **D must never be 0** — immediate PID loop crash, requires power cycle.
+- **I and D must not be very small** (below ~50–100) — delayed crash, same recovery.
+- **There is no firmware error flag** for either condition — the TEC simply refuses to start with a generic "Interlock?" message that is misleading.
+
+**Recovery:** Power cycle the Maiman board (unplug and reconnect power). Restart the Jupyter kernel. Reload valid PID values before attempting to enable the TEC.
+
+**File changed:** Autotuner cell in `sf8xxx_full_test_notebook.ipynb` — I_SAFE raised from 10 to 500.
+
+---
+
 ## 8. Physical wiring reference
 
 ### Output socket (14-pin, on the controller board)
@@ -640,7 +732,302 @@ If three or more tests fail simultaneously — especially `test_tec_enables_with
 
 ---
 
-## 11. Glossary
+## 11. Jupyter notebook testing and known issues
+
+The file `sf8xxx_full_test_notebook.ipynb` runs the same hardware checks as the pytest suite but inside a Jupyter notebook, which is useful for interactive exploration and printing live readings to the screen.
+
+Three bugs were found and fixed during notebook testing. They are recorded here because they can recur if the notebook is adapted or ported to a new environment.
+
+---
+
+### Bug 3 — False PASS: TEC not running but test reported success
+
+**Symptom:** The TEC response test printed output like:
+```
+Initial: 23.82, Final: 23.83, Set: 25.82
+PASS
+```
+The temperature moved by only 0.01 °C — indistinguishable from thermal noise — yet the test passed.
+
+**Root cause:** Two of the same bugs already found in the pytest files (Bugs 1 and 2) were present in the notebook cell as well:
+1. `deny_interlock()` was not called before `set_tec_int()`, so pin 15 was still blocking the TEC.
+2. `set_tec_temperature()` was called *after* `set_tec_on()` (wrong order), so the TEC started with the digital register still at 0.00 °C. On this particular run the setpoint happened to be non-zero from a previous cell, so the TEC may have started — but regardless the temperature did not move meaningfully.
+
+The test passed anyway because the three assertions were too weak:
+- `assert t_final > t_initial` — 0.01 °C of thermal noise was enough to satisfy this.
+- `assert abs(t_final - t_set) < 3.0` — with a 3.0 °C window, a non-moving temperature that started 1.99 °C below the setpoint passed trivially.
+- The stability check also passed trivially since the temperature was not changing.
+
+**Fix:** The notebook cell was rewritten to:
+1. Call `deny_interlock()` as the first step.
+2. Read the current temperature and write the setpoint **before** calling `set_tec_on()`.
+3. Replace the three weak assertions with:
+   - Check the TEC state register shows RUNNING (catches interlock failures directly).
+   - Check that peak TEC current > 0.01 A during the ramp (confirms Peltier is connected).
+   - Check that the final temperature error is smaller than the initial error (temperature actually moved toward the setpoint).
+
+---
+
+### Bug 4 — TEC current reads 0.000 A even when the Peltier is working
+
+**Symptom:** After the fix for Bug 3 was applied, the test produced:
+```
+Initial temp : 24.07 degC
+Setpoint     : 26.07 degC
+Final (15 s) : 26.12 degC
+Error        : 0.05 degC
+TEC current  : 0.000 A
+FAIL: TEC current is 0.000 A — Peltier does not appear to be connected.
+```
+The temperature had clearly moved 2 °C and was sitting at the setpoint — the TEC was working perfectly — yet the current read as zero.
+
+**Root cause:** The `TEC_CURRENT_MEASURED` register (`0A16h`) has a resolution of 0.1 A. In the test, the current was read *at the end* of the 15-second measurement loop, by which point the temperature had already stabilised to within 0.05 °C of the setpoint. A well-tuned PID controller at steady state drives only a tiny maintenance current (just enough to overcome passive heat loss through the Peltier mounting). This maintenance current is below 0.1 A and therefore rounds to 0.000 A in the register. This is completely normal — it means the PID is working well, not that the Peltier is disconnected.
+
+The current is highest immediately after `set_tec_on()`, when the temperature error is at its maximum (the full 2 °C step). That is the right moment to sample it.
+
+**Fix:** The notebook cell was updated to read the current once immediately after `set_tec_on()` (before the 15-second loop), and to also record it at every step of the loop. The assertion checks the *peak* current seen across the entire run, not the final value. The output now also separately prints the peak current and the final current so the distinction is clear.
+
+```
+Peak current : 0.800 A  (final: 0.000 A)
+```
+
+---
+
+### Bug 5 — Jupyter kernel hangs on re-run: background thread holds COM3 open
+
+**Symptom:** After running the notebook once, re-running it from the first cell caused it to hang indefinitely. The first cell (just `import time` and the SF8xxx import) appeared to be running but never completed.
+
+**Root cause:** When `SF8xxx(COM_PORT, start_thread=False)` was called in the connection cell, the `start_thread=False` parameter was silently ignored — the background temperature-polling thread (`temperature_thread`) was always started regardless of the argument. The thread runs an infinite loop that polls the TEC temperature every 2 seconds and holds the serial port lock open.
+
+When the notebook finished (or when the shutdown cell ran), the thread was not stopped and the serial port (`COM3`) was not closed. On re-run, two things happened:
+- The second attempt to open COM3 failed because the port was still held by the previous `SF8xxx` instance.
+- The kernel appeared to hang because it was waiting for the old thread to finish, or because the port open call was blocking.
+
+A secondary issue: the thread function ended with `sys.exit(0)`. In Python, calling `sys.exit()` inside a background thread raises a `SystemExit` exception. In a non-main thread this only terminates that thread, but in some environments (including Jupyter) the exception propagates in unexpected ways and can leave the kernel in a bad state.
+
+**Fix — `controller.py` (three changes):**
+
+1. **`start_thread` now works.** The thread is created unconditionally (so `temperature_thread` always exists as an attribute) but only started if `start_thread=True`:
+   ```python
+   self.temperature_thread = threading.Thread(..., daemon=True)
+   if start_thread:
+       self.temperature_thread.start()
+   ```
+   The notebook passes `start_thread=False` to avoid the background polling thread entirely during testing.
+
+2. **Thread is a daemon thread.** `daemon=True` means Python will automatically kill the thread when the main process (the Jupyter kernel) exits, even if the thread is still running. This prevents the thread from ever blocking a kernel restart.
+
+3. **`__del__` has a timeout.** The destructor previously called `self.temperature_thread.join()` with no timeout, which would block forever if the thread was stuck. It now calls `join(timeout=5)` and also checks `is_open` before closing the port:
+   ```python
+   def __del__(self):
+       if not self.connected:
+           return
+       self.end_threads = True
+       if self.temperature_thread.is_alive():
+           self.temperature_thread.join(timeout=5)
+       if self.dev.is_open:
+           self.dev.close()
+   ```
+
+4. **Removed `sys.exit(0)` from the thread function.** The polling loop simply `return`s when `end_threads` is set. Using `sys.exit()` inside a non-main thread is incorrect and can cause unpredictable behaviour.
+
+**Fix — notebook shutdown cell:** The shutdown cell was updated to explicitly stop the thread and close the serial port before the cell finishes, so re-running the notebook from cell 1 always finds COM3 free:
+```python
+controller.end_threads = True
+controller.temperature_thread.join(timeout=5)
+controller.dev.close()
+```
+
+**If the kernel is already stuck:** Go to Kernel → Restart in Jupyter. This kills all threads and releases COM3. Then re-run from the first cell.
+
+---
+
+## 12. PID tuning in practice — the Ziegler-Nichols autotuner
+
+This section covers what was done to find working PID gains for this specific laser PCB, why the factory values were no longer known, what the Ziegler-Nichols method is conceptually, and what values were found to work well.
+
+---
+
+### 12.1 Why PID tuning was needed
+
+The SF8025-NM ships with factory PID gains. These were changed during early experiments (by the user manually entering values in the BenchSoft GUI and via Python scripting during debugging). After several rounds of changes, the exact factory values were no longer known. The gains in the controller at the start of this tuning session were P=350, I=5000, D=50 — which produced continuous ±1.5 °C oscillation around the setpoint and never settled. A fresh set of gains was needed from scratch.
+
+---
+
+### 12.2 How PID values are changed in Python
+
+The `controller.py` driver exposes these methods:
+
+```python
+controller.get_pid()           # → (P, I, D) tuple of integers
+controller.set_pid(p, i, d)   # write all three at once
+controller.set_pid_p(value)   # write P alone
+controller.set_pid_i(value)   # write I alone
+controller.set_pid_d(value)   # write D alone
+```
+
+**Critical safety rules before changing PID values:**
+
+| Rule | Reason |
+|---|---|
+| Never set D = 0 | Immediate firmware PID crash — requires hardware power cycle |
+| Never set I < 100 or D < 50 | Firmware enters a broken state — TEC will not restart (Bug 6, Section 7) |
+| Always read back after writing | `get_pid()` confirms the firmware accepted the write |
+| Always save originals first | `orig_p, orig_i, orig_d = controller.get_pid()` before any change |
+
+The PID Adjustment cell in the notebook enforces these rules with guards that block D=0 and roll back to saved values if the TEC fails to start after the write.
+
+---
+
+### 12.3 What PID gains actually do (conceptual)
+
+Imagine the PID controller as a driver pressing a car accelerator to hold 100 km/h:
+
+- **P (Proportional):** Presses harder the more speed is below the target. A larger P responds faster but overshoots more — the driver slams the accelerator and blows past 100 km/h.
+- **I (Integral):** Corrects for a small persistent gap. If the car has been slightly below 100 km/h for a while, the driver gradually adds a small extra push to close that last tiny error. Increase I to reduce steady-state offset.
+- **D (Derivative):** Eases off as the target approaches to prevent overshoot. If the car is closing in on 100 km/h very rapidly, the driver backs off slightly to avoid shooting past. Increase D to reduce oscillation and overshoot.
+
+For a TEC controller, the output is Peltier current (not a car accelerator), the measurement is the thermistor temperature, and the setpoint is the target temperature. The P, I, D registers in the Maiman controller store integer gain values whose exact unit scaling is not documented — only the relative behaviour matters for tuning.
+
+---
+
+### 12.4 Why the system was oscillating with P=350, I=5000, D=50
+
+With those values the step response showed sustained ±1.5 °C oscillations that never damped:
+
+```
+    0s   25.90   -3.00°C   -0.800 A   settling...
+    2s   28.56   -0.14°C   +0.800 A   settling...
+    4s   31.38   +2.48°C   +1.000 A   settling...
+   ...continues oscillating ±1.5°C for the full 60s
+```
+
+The P term was too large — every time the temperature got close to the setpoint, the controller overshot. The I term at 5000 was also too strong, building up integrator "wind-up" that kept pushing in the wrong direction after the setpoint was crossed. The D term at 5000 was not large enough relative to P and I to prevent the oscillation.
+
+This is a classic "too much gain" situation: the system is unstable because the controller is trying to react too fast for the thermal mass of the laser PCB to follow.
+
+---
+
+### 12.5 The Ziegler-Nichols Critical Gain method
+
+The Ziegler-Nichols Critical Gain (also called Ultimate Gain) method is a systematic way to find PID values without knowing the thermal model of the system. It works by finding the point at which the system is just barely unstable.
+
+**The procedure:**
+
+1. Set I to a small value (not zero — see Bug 6) and D to a small value. This makes the integrator and derivative terms nearly inactive so the response is mostly governed by P alone.
+2. Apply a small temperature step (e.g. 2 °C) and watch how the temperature responds.
+3. Increase P step by step. At low P, the temperature settles smoothly to the setpoint (damped response). At high P, the temperature oscillates and never settles.
+4. The critical gain **Ku** is the P value at which oscillations are **sustained** — neither growing nor dying. The period of those oscillations is **Tu** (seconds).
+5. From Ku and Tu, compute the recommended gains using the Ziegler-Nichols formula:
+   - P_rec = 0.6 × Ku
+   - I and D are computed from the oscillation period
+
+Why does this work? At exactly Ku, the controller's response speed matches the thermal lag of the system. Below Ku the system is stable; above it is unstable. The Ziegler-Nichols formula deliberately sets the operating point at 60% of Ku, providing a stability margin while still responding quickly.
+
+---
+
+### 12.6 What the autotuner found for this system
+
+The Ziegler-Nichols autotuner cell in `sf8xxx_full_test_notebook.ipynb` swept P from 100 to 400 with I=500, D=50 (firmware-safe minimum values) and observed:
+
+| P value | Crossings in 35 s | Amplitude trend | Interpretation |
+|---|---|---|---|
+| 100 | 3 | Decaying | Well below Ku — heavily damped |
+| 200 | 9 | Growing | Above Ku — oscillations building up |
+| 300 | 9 | Growing faster | Well above Ku |
+| 400 | ABORT | — | Temperature ran 9 °C from base — runaway |
+
+The transition from 3 crossings (P=100, decaying) to 9 crossings with growing amplitude (P=200) means **Ku is between 100 and 200**, approximately **Ku ≈ 150** for this system with I=500, D=50.
+
+Note: the "crossings" counts how many times the temperature crosses the setpoint. At P=100, the temperature settled slowly with minimal oscillation. At P=200 onward, oscillations were present but growing — meaning the controller was already past the critical gain.
+
+**Ziegler-Nichols recommendation:** P_rec = 0.6 × 150 ≈ **90**
+
+---
+
+### 12.7 What P=90 looks like in practice
+
+With P=90, I=500, D=50, a 3 °C step response produced:
+
+```
+Step: 25.90 → 28.90 °C
+
+  0s   25.90   -3.00°C   -1.000 A   P dominant — driving toward setpoint
+  2s   27.96   -0.94°C   -1.000 A   Fast approach
+  4s   31.38   +2.48°C   +1.000 A   Overshoot peak — PID reversed
+  8s   29.89   +0.99°C   +1.000 A   Cooling back toward setpoint
+ 12s   28.08   -0.82°C   -0.100 A   Undershooting slightly
+ 16s   28.58   -0.32°C    0.000 A   Closing in
+ 28s   28.80   -0.10°C    0.000 A   STABLE
+ ...
+ 58s   28.78   -0.12°C    0.000 A   STABLE
+```
+
+- **Rise time:** ~10 seconds to first reach the setpoint
+- **Overshoot:** +2.5 °C peak (temperature hit 31.4 °C before settling)
+- **Settling time:** ~28 seconds to stay within ±0.1 °C
+- **Steady-state error:** −0.10 to −0.12 °C (slightly below setpoint)
+- **No sustained oscillation** — a major improvement over the previous ±1.5 °C continuous oscillation
+
+---
+
+### 12.8 Why overshoot cannot be fully eliminated by tuning alone
+
+The 2.5 °C overshoot on a 3 °C step is mainly a **physical constraint**, not a tuning problem.
+
+When the temperature error is large (e.g. 3 °C below setpoint), the PID output saturates at the maximum Peltier current (1.0 A for this setup). Once saturating, P does not matter — the Peltier drives at 1 A regardless of whether P=90 or P=350. The Peltier deposits heat into the laser mount at the same rate either way. By the time the temperature reaches the setpoint and the PID output finally drops below 1 A, there is already heat "in transit" through the thermal mass of the mount that will continue raising the temperature for another second or two — producing the overshoot.
+
+**What does help:**
+- A smaller temperature step (2 °C instead of 3 °C) means less time at the 1 A limit, less thermal momentum
+- Increasing D (derivative) causes the PID to start backing off earlier as the temperature approaches the setpoint — reducing, though not eliminating, the overshoot
+- Accepting the overshoot: for laser operation, you set the temperature once at startup and wait for it to stabilise before turning on the laser driver. The overshoot during the initial ramp does not matter for wavelength stability
+
+**What does not help:**
+- Reducing P does not reduce overshoot if the system is current-limited during the approach. Reducing P from 90 to 40 actually made overshoot *worse* (3.2 °C) by slowing the post-overshoot recovery.
+
+---
+
+### 12.9 Remaining steady-state error and how to fix it
+
+With P=90, I=500, the temperature settles ~0.10–0.12 °C below setpoint. This small persistent gap is the **steady-state error** — the integrator (I term) is accumulating but not strong enough to fully close it within the 60-second observation window.
+
+To eliminate it: increase I from 500 to ~1500. The I term will accumulate faster and pull the temperature up the remaining 0.1 °C. Recommended next trial:
+
+```python
+NEW_P = 90
+NEW_I = 1500
+NEW_D = 50
+```
+
+The target steady-state error for this application is ±0.1 °C. With P=90 and sufficient I, the system should meet this.
+
+---
+
+### 12.10 Summary: recommended PID values and tuning workflow
+
+**Recommended values (confirmed stable, April 2026):**
+
+| Gain | Value | Why |
+|---|---|---|
+| P | 90 | 60% of Ku ≈ 150 — stable, responsive, no sustained oscillation |
+| I | 1500 (trial) | Stronger integrator to close the 0.10 °C steady-state offset |
+| D | 50 | Minimum firmware-safe value; reduces overshoot slightly |
+
+**If you need to re-tune from scratch:**
+
+1. Run the autotuner cell in the notebook with `P_START=100, P_MAX=500, P_INCREMENT=50, I_SAFE=500, D_SAFE=50`.
+2. Note the P at which oscillations first appear (crossings jump from <4 to >6 with growing amplitude) — this is approximately Ku.
+3. Set `NEW_P = round(0.6 * Ku)`, keep I=500, D=50, and test with the PID Adjustment cell.
+4. Once stable, increase I gradually (500 → 1000 → 1500) until steady-state error is < 0.05 °C.
+5. If overshoot is too large for your application, increase D (50 → 100 → 200) — accept that some overshoot is unavoidable on large steps due to thermal inertia.
+
+**Constraints that must never be violated:**
+- D = 0 → immediate firmware crash, requires power cycle
+- I < 100 or D < 50 → delayed firmware crash, TEC stops being startable (Bug 6)
+
+---
+
+## 13. Glossary
 
 | Term | Plain-language definition |
 |---|---|

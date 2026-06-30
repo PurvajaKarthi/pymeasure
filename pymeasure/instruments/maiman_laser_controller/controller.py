@@ -16,7 +16,6 @@ Created on Fri May 17 13:35:35 2024
 import threading
 import serial
 import time
-import sys
 
 class SF8xxx:
     """
@@ -49,16 +48,20 @@ class SF8xxx:
         poll_interval = 2
         self.temperature_thread = threading.Thread(target=self.poll_tec_temperature,
                                               args=(temperature_threshold,
-                                                    poll_interval,))
-        self.temperature_thread.start()
+                                                    poll_interval,),
+                                              daemon=True)
+        if start_thread:
+            self.temperature_thread.start()
 
     
     def __del__(self):
         if not self.connected:
             return
         self.end_threads = True
-        self.temperature_thread.join()
-        self.dev.close()
+        if self.temperature_thread.is_alive():
+            self.temperature_thread.join(timeout=5)
+        if self.dev.is_open:
+            self.dev.close()
         
         
     def __get_response(self, parameter):
@@ -168,9 +171,13 @@ class SF8xxx:
     
     def get_tec_current(self):
         res = self.__get_response('TEC_CURRENT_MEASURED')
-        current = res.rtoi()
-            
-        return current / 10
+        raw = res.rtoi()   # unsigned 0-65535
+        # Register uses two's complement: values >= 0x8000 are negative currents
+        # (one Peltier drive direction). Without this, 0xFFFF reads as 6553.5 A
+        # instead of the correct -0.1 A.
+        if raw >= 0x8000:
+            raw -= 0x10000
+        return raw / 10
     
     
     def get_tec_current_limit(self):
@@ -214,14 +221,31 @@ class SF8xxx:
 
     def get_pid_p(self):
         return self.__get_response('PID_P').rtoi()
-        
 
     def get_pid_i(self):
         return self.__get_response('PID_I').rtoi()
-    
 
     def get_pid_d(self):
         return self.__get_response('PID_D').rtoi()
+
+    def set_pid_p(self, value):
+        self.__set_routine('PID_P', int(value))
+
+    def set_pid_i(self, value):
+        self.__set_routine('PID_I', int(value))
+
+    def set_pid_d(self, value):
+        self.__set_routine('PID_D', int(value))
+
+    def get_pid(self):
+        """Return (P, I, D) as a tuple of integers."""
+        return self.get_pid_p(), self.get_pid_i(), self.get_pid_d()
+
+    def set_pid(self, p, i, d):
+        """Set all three PID gains at once."""
+        self.set_pid_p(p)
+        self.set_pid_i(i)
+        self.set_pid_d(d)
         
   
     def __set_routine(self, parameter, value):
@@ -305,9 +329,14 @@ class SF8xxx:
         
         
     def set_tec_off(self):
-        if not self.driver_off:
+        # Query the hardware directly rather than relying on the cached
+        # self.driver_off flag.  The cache can become stale if set_driver_on()
+        # was called while the firmware correctly blocked the command (e.g.
+        # during the driver-interlock test), because `type(x) != None` is
+        # always True so self.driver_off=False was written unconditionally.
+        if self.driver_on():
             return 'driver'
-        
+
         if type(self.__set_routine('TEC_STATE', 0x0010)) != None:
             self.tec_off = True
             return 0
@@ -336,8 +365,6 @@ class SF8xxx:
                 print("> ", end='')
                 
             time.sleep(poll_interval)
-            
-        sys.exit(0)
 
     
 class Command:
